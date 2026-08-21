@@ -57,6 +57,26 @@ def ayakta_mi():
         return False
 
 
+def calisan_sunucu_args():
+    """Calisan llama-server'in gercek komut satirini /proc'tan oku."""
+    r = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    pid = r.stdout.split()[0]
+    try:
+        with open("/proc/%s/cmdline" % pid, "rb") as f:
+            return [a for a in f.read().decode().split("\0") if a]
+    except Exception:
+        return None
+
+
+def arg_degeri(args, bayrak):
+    try:
+        return args[args.index(bayrak) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
 def port_dolu_mu():
     s = socket.socket()
     s.settimeout(1)
@@ -90,9 +110,33 @@ for yol, ad in [(BINARY, "llama-server"), (MODEL, "model dosyasi")]:
         sys.exit(1)
 
 # --------------------------------------------------------------- baslatma
-if ayakta_mi():
-    print("\nSunucu ZATEN CALISIYOR, yeniden baslatilmadi.")
+istenen = {"-m": MODEL, "-c": str(BAGLAM), "-t": str(THREAD),
+           "-tb": str(THREAD_BATCH)}
+mevcut = calisan_sunucu_args() if ayakta_mi() else None
+farklar = []
+if mevcut:
+    for bayrak, deger in istenen.items():
+        simdiki = arg_degeri(mevcut, bayrak)
+        if simdiki != deger:
+            farklar.append((bayrak, simdiki, deger))
+
+if mevcut and not farklar:
+    print("\nSunucu ZATEN ISTENEN AYARLARLA CALISIYOR, yeniden baslatilmadi.")
+elif mevcut and os.environ.get("YENIDEN_BASLATMA") == "0":
+    print("\nUYARI: Calisan sunucunun ayarlari FARKLI ama yeniden baslatma kapali:")
+    for bayrak, simdiki, istenen_d in farklar:
+        print("   %-4s calisan: %-12s istenen: %s" % (bayrak, simdiki, istenen_d))
+    print("   -> Asagidaki olcum ESKI ayarlarla yapiliyor.")
 else:
+    if mevcut:
+        print("\nCalisan sunucunun ayarlari farkli, yeniden baslatiliyor:")
+        for bayrak, simdiki, istenen_d in farklar:
+            print("   %-4s %s -> %s" % (bayrak, simdiki, istenen_d))
+        subprocess.run(["pkill", "-f", "llama-server"])
+        for _ in range(60):
+            time.sleep(1)
+            if not port_dolu_mu():
+                break
     if port_dolu_mu():
         print("\nHATA: %d portu baska bir surec tarafindan kullaniliyor." % PORT)
         print("Baska port deneyin:  LLM_PORT=8081")
