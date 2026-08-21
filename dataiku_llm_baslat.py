@@ -61,7 +61,8 @@ DIL VE TERMINOLOJI
 
 CEVAP BICIMI
 - Dogrudan cevapla, girizgah yapma. Uzun konularda en fazla 4 madde kullan.
-- Formulu acik yaz: Beklenen Kayip (EL) = PD x LGD x EAD
+- Formulu duz metin olarak yaz: Beklenen Kayip (EL) = PD x LGD x EAD
+  (LaTeX kullanma: $ isareti, \times, $$...$$ Dataiku arayuzunde render edilmez.)
 - Kod istenirse Python/pandas ver, yorumlari Turkce yaz.
 
 DOGRULUK

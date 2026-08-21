@@ -82,31 +82,44 @@ Kayıp Oranı)", "EAD (Temerrüt Anındaki Risk Tutarı)"** — hepsi doğru. Si
 `dataiku_llm_baslat.py` içinde gömülü; Dataiku LLM Mesh'te de aynısını kullanın.
 Maliyeti 533 girdi token'ı (yaklaşık 3 saniye prefill).
 
-### Düşünme modu: 2,8× maliyet, belirgin kalite kazancı yok
+### Düşünme modu: 2,6× maliyet, kalitede net kazanç yok (adil test)
 
-Çok adımlı bir soruyla (aritmetik + TFRS 9 aşama geçişi + geriye dönük test metodolojisi)
-iki mod karşılaştırıldı:
+Çok adımlı bir soruyla (aritmetik + TFRS 9 aşama geçişi + geriye dönük test metodolojisi),
+her iki moda da yeterli token bütçesi verilerek ölçüldü:
 
 | | Düşünme kapalı | Düşünme açık |
 |---|---|---|
-| Süre | 122 sn | **347 sn (2,8×)** |
-| Üretilen token | 800 | 2.378 (+4.827 karakter akıl yürütme) |
-| Beklenen kayıp hesabı (3.600.000 TL) | doğru | doğru |
-| İlk token gecikmesi | 6,5 sn | 0,8 sn |
+| Süre | 147 sn | **389 sn (2,6×)** |
+| Üretilen token | 991 | 2.683 (+5.109 karakter akıl yürütme) |
+| Beklenen kayıp (3.600.000 TL) | doğru | doğru |
+| Hız | 6,72 tok/sn | 6,90 tok/sn |
 
-**Sonuç: düşünme modu bu iş için maliyetini karşılamıyor.** Aritmetiği ikisi de doğru
-yaptı, içerik derinliği benzerdi. Dahası düşünme modunda dil bozulmaları görüldü —
-cevabın ortasında İngilizce kelime sızması ("şu değişiklikler *occurs*") ve bozuk Türkçe
-("görülürüldüğünde"). Muhtemel sebep: üreticinin düşünme modu için önerdiği
-`temperature=1.0`, Q4 kuantizasyonuyla birleşince örnekleme gürültüsünü artırıyor.
-Düşünme modu kullanılacaksa `temperature=0.7` denenmeli.
+**Düşünme modunun kazandırdığı:** (c) şıkkında 6 adım (5 yerine), Gini ve Hosmer-Lemeshow
+gibi somut test adları, segment bazlı sapma analizi; (b) şıkkında faiz gelirinin brüt
+tanınmaya devam ettiği doğru detayı.
 
-Akıl yürütme zinciri Türkçe soruya rağmen **İngilizce** üretiliyor; bu Qwen'de normaldir
-ve cevabın dilini etkilemez.
+**Düşünme modunun kaybettirdiği:**
+- **Notasyon hatası:** yüzdeleri "%3,2 (%0,032)" diye yazdı — 0,032 zaten %3,2'dir,
+  "%0,032" yanlıştır. Düşünmesiz mod bunu doğru yazmıştı ("%3,2 = 0,032").
+- (b) şıkkında anlamsız bir madde: "risk iştirak göstergeleri değişir" (böyle bir terim yok).
+- Daha fazla dil kayması: "Zaman Horizonu" (doğrusu zaman ufku), "yüksek çıkarırsa".
 
-> Not: ilk ölçümde düşünmesiz moda 800 token limiti konduğu için cevap kesilmişti;
-> karşılaştırma bu yüzden düşünme modu lehine yanlıydı. Betikteki bütçe 2.500'e çıkarıldı
-> ve limite takılma artık uyarı basıyor.
+**Düşünmesiz modun öne çıktığı yer:** sapmanın istatistiksel olarak anlamlı olup olmadığını
+sorgulayan madde — gerçek bir model validasyon uzmanının ilk soracağı şey. Düşünme modunda
+bu yok.
+
+**Karar: düşünme modu kapalı kalsın.** 2,6× süre karşılığında aldığınız birkaç ek madde,
+getirdiği notasyon ve dil hatalarını telafi etmiyor. Düşünme modu kullanılacaksa
+`temperature=0.7` ile denenmeli (üretici 1.0 öneriyor ama Q4 ile gürültü artıyor).
+
+Akıl yürütme zinciri Türkçe soruya rağmen **İngilizce** üretiliyor; Qwen'de normaldir,
+cevabın dilini etkilemez.
+
+### LaTeX uyarısı
+
+Model matematiği varsayılan olarak LaTeX ile yazıyor (`$EL = PD \times LGD$`). Dataiku
+Prompt Studio ve Agent Chat bunu render etmez, ham `$` ve `\times` görünür. Sistem mesajına
+"matematiği düz metin yaz, LaTeX kullanma" satırı eklendi.
 
 ### -tb (prefill thread) kazancı
 
