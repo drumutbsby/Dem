@@ -129,12 +129,54 @@ def main():
 
     # --- 2) ikilileri paketle
     print("\n1) llama.cpp ikilileri paketleniyor...")
+
+    # llama-server'in ihtiyac duydugu paylasimli kutuphaneler build/bin
+    # disinda kalmis olabilir; ldd ile bulup pakete ekliyoruz. Aksi halde
+    # test sunucusunda "libllama.so: cannot open shared object file" alinir.
+    ek_kutuphaneler = []
+    ldd = komut(["ldd", os.path.join(BIN_DIZIN, "llama-server")])
+    for satir in ldd.splitlines():
+        if "=>" not in satir:
+            continue
+        hedef = satir.split("=>")[1].strip().split(" ")[0]
+        if not hedef.startswith("/") or not os.path.exists(hedef):
+            continue
+        # sistem kutuphanelerini degil, projeye ait olanlari topla
+        if os.path.realpath(hedef).startswith(os.path.realpath(LLAMA_KOK)):
+            if os.path.dirname(os.path.realpath(hedef)) != os.path.realpath(BIN_DIZIN):
+                ek_kutuphaneler.append(hedef)
+    if ek_kutuphaneler:
+        print("   build/bin disinda %d kutuphane bulundu, pakete ekleniyor:"
+              % len(ek_kutuphaneler))
+        for k in ek_kutuphaneler:
+            print("     %s" % k)
+
     bin_tar = os.path.join(PAKET, "llama-cpp-ikililer-rhel9-x64.tar.gz")
     with tarfile.open(bin_tar, "w:gz") as t:
         t.add(BIN_DIZIN, arcname="llama-cpp-bin")
+        for k in ek_kutuphaneler:
+            t.add(k, arcname="llama-cpp-bin/" + os.path.basename(k))
     boyut = os.path.getsize(bin_tar)
     print("   %s (%s)" % (os.path.basename(bin_tar), mb(boyut)))
     paket_dosyalari.append((bin_tar, boyut))
+
+    # paketin icerigini dogrula: llama-server + gerekli .so dosyalari var mi?
+    with tarfile.open(bin_tar) as t:
+        icerik = [os.path.basename(n) for n in t.getnames()]
+    gerekli = ["llama-server"]
+    for satir in ldd.splitlines():
+        ad = satir.strip().split(" ")[0]
+        if ad.startswith(("libllama", "libggml", "libmtmd")):
+            gerekli.append(ad)
+    eksik_kutuphane = [g for g in gerekli if g not in icerik]
+    if eksik_kutuphane:
+        print("   !!! UYARI: pakette eksik: %s" % ", ".join(eksik_kutuphane))
+        print("       Test sunucusunda calismayabilir; ldd ciktisina bakin.")
+    else:
+        print("   Icerik dogrulandi: llama-server + %d kutuphane"
+              % (len(gerekli) - 1))
+    satirlar += ["LLAMA-SERVER BAGIMLILIKLARI (ldd)"] + \
+                ["  " + x.strip() for x in ldd.splitlines()] + [""]
 
     # --- 3) istege bagli kaynak kod
     if KAYNAK_DAHIL:
