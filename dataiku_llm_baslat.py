@@ -1,50 +1,95 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-dataiku_llm_baslat.py — ADIM 2: modeli baslatir ve deneme sorusu sorar.
+dataiku_llm_baslat.py — Qwen3.5-122B sunucusunu baslatir, sistem mesajiyla dener.
 
-- llama-server'i notebook'tan BAGIMSIZ (detached) baslatir; notebook kapansa
-  da sunucu ayakta kalir.
-- Model yuklenene kadar bekler (71.7 GB -> ilk acilis birkac dakika surebilir).
-- Turkce bir deneme sorusu sorar, cevabi ve token/sn hizini yazar.
+Dataiku Notebook icine yapistirip calistirin. Tekrar calistirmak zararsizdir:
+sunucu istenen ayarlarla calisiyorsa dokunmaz, ayarlar farkliysa yeniden baslatir.
 
-Tekrar calistirmak zararsizdir: sunucu zaten calisiyorsa yeniden baslatmaz.
-Durdurmak icin:  DURDUR=1 ile calistirin.
+Ortam degiskenleri:
+  DURDUR=1              sunucuyu durdur ve cik
+  LLM_THREAD=28         uretim thread sayisi (olculen en iyi: 32)
+  LLM_THREAD_BATCH=28   prefill thread sayisi (olculen en iyi: 28)
+  LLM_CTX=131072        baglam uzunlugu (varsayilan 32768)
+  LLM_MLOCK=1           model sayfalarini RAM'e kilitle
+  DUSUNME=1             dusunme modunu ac (kalite artar, cevap dakikalar surer)
+  SORU="..."            kendi deneme sorunuz
 """
 
 import json
 import os
+import signal
 import socket
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 
+# ----------------------------------------------------------------- AYARLAR
 KLASOR = os.environ.get(
     "LLM_KLASOR", "/data/dataiku/DATA_DIR/managed_folders/UMUT/NwPGcMBJ")
-MODEL = os.path.join(KLASOR, "Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf")
+MODEL = os.environ.get(
+    "LLM_MODEL",
+    os.path.join(KLASOR, "Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf"))
 BINARY = os.environ.get(
     "LLAMA_SERVER", os.path.expanduser("~/llama.cpp/build/bin/llama-server"))
 PORT = int(os.environ.get("LLM_PORT", "8080"))
 BAGLAM = int(os.environ.get("LLM_CTX", "32768"))
-# Olculen (llama-bench, 2026-08-21): uretim 32 thread'te en hizli (7.23 tok/sn),
-# prefill 28 thread'te (73 tok/sn); 32'de cekismeden dusuyor. Bu yuzden ayri ayri.
+# Olculen (llama-bench, 21.08.2026): uretim 32 thread'te 7.23 tok/sn,
+# prefill 28 thread'te 73 tok/sn (32'de cekismeden dusuyor). Bu yuzden ayri.
 THREAD = int(os.environ.get("LLM_THREAD", str(os.cpu_count() or 32)))
-THREAD_BATCH = int(os.environ.get("LLM_THREAD_BATCH", str(max(1, (os.cpu_count() or 32) - 4))))
-MLOCK = os.environ.get("LLM_MLOCK", "0") == "1"  
+THREAD_BATCH = int(os.environ.get("LLM_THREAD_BATCH",
+                                  str(max(1, (os.cpu_count() or 32) - 4))))
+MLOCK = os.environ.get("LLM_MLOCK", "0") == "1"
+DUSUNME = os.environ.get("DUSUNME", "0") == "1"
 LOG = os.path.expanduser("~/llama-server.log")
 KOK_URL = "http://127.0.0.1:%d" % PORT
 
-# Unsloth/Qwen'in onerdigi ornekleme ayarlari (dusunmesiz/instruct mod)
-ORNEKLEME = dict(temperature=0.7, top_p=0.8, presence_penalty=1.5)
+# ---------------------------------------------------- SISTEM MESAJI (PROMPT)
+SISTEM_MESAJI = """Sen bir bankanin veri ve risk analitigi ekibine destek veren yapay zeka asistanisin.
+
+DIL VE TERMINOLOJI
+- Her zaman Turkce yanit ver. Yerlesik Turkce finans terminolojisini kullan,
+  Ingilizce terimleri kelime kelime cevirme.
+- Dogru karsiliklar: default = temerrut (asla "varsayilan"), exposure = risk tutari,
+  PD = temerrut olasiligi, LGD = temerrut halinde kayip orani,
+  EAD = temerrut anindaki risk tutari, recovery = tahsilat, collateral = teminat,
+  provision = karsilik, impairment = deger dusuklugu, write-off = zarar kaydi,
+  delinquency = gecikme, backtesting = geriye donuk test,
+  overfitting = asiri ogrenme, feature = degisken, target = hedef degisken.
+- Kisaltmalari ilk gectigi yerde ac: "PD (temerrut olasiligi)" gibi.
+
+CEVAP BICIMI
+- Dogrudan cevapla, girizgah yapma. Uzun konularda en fazla 4 madde kullan.
+- Formulu acik yaz: Beklenen Kayip (EL) = PD x LGD x EAD
+- Kod istenirse Python/pandas ver, yorumlari Turkce yaz.
+
+DOGRULUK
+- Emin olmadigin sayisal deger, oran veya mevzuat maddesi UYDURMA;
+  "bu deger dogrulanmali" de ve neyin dogrulanmasi gerektigini soyle.
+- BDDK, Basel III, TFRS 9 gibi duzenlemelerde genel cerceveyi anlat,
+  madde numarasi ve tarih uydurma.
+- Varsayim yaptiysan varsayimi cevabin sonunda acikca belirt.
+
+GIZLILIK
+- Sana verilen musteri bilgisi, hesap numarasi veya tutari cevapta gereksiz yere
+  tekrar etme; orneklerde gercek veri yerine temsili deger kullan."""
+
+# Uretici onerisi (Qwen3.5 model karti): instruct / dusunmesiz mod
+ORNEKLEME = {"temperature": 0.7, "top_p": 0.8, "presence_penalty": 1.5}
+if DUSUNME:  # dusunme modu icin farkli parametreler onerilir
+    ORNEKLEME = {"temperature": 1.0, "top_p": 0.95, "presence_penalty": 1.5}
+
+VARSAYILAN_SORU = ("Bir bankada kredi riski modellemesinde PD, LGD ve EAD "
+                   "kavramlarini birer cumleyle acikla ve beklenen kayip "
+                   "formulunu yaz.")
 
 
+# ------------------------------------------------------- YARDIMCI FONKSIYONLAR
 def istek(yol, govde=None, zaman_asimi=30):
-    url = KOK_URL + yol
     veri = json.dumps(govde).encode() if govde is not None else None
-    r = urllib.request.Request(
-        url, data=veri, headers={"Content-Type": "application/json"})
+    r = urllib.request.Request(KOK_URL + yol, data=veri,
+                               headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(r, timeout=zaman_asimi) as y:
         return json.loads(y.read().decode())
 
@@ -57,26 +102,6 @@ def ayakta_mi():
         return False
 
 
-def calisan_sunucu_args():
-    """Calisan llama-server'in gercek komut satirini /proc'tan oku."""
-    r = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, text=True)
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
-    pid = r.stdout.split()[0]
-    try:
-        with open("/proc/%s/cmdline" % pid, "rb") as f:
-            return [a for a in f.read().decode().split("\0") if a]
-    except Exception:
-        return None
-
-
-def arg_degeri(args, bayrak):
-    try:
-        return args[args.index(bayrak) + 1]
-    except (ValueError, IndexError):
-        return None
-
-
 def port_dolu_mu():
     s = socket.socket()
     s.settimeout(1)
@@ -86,125 +111,182 @@ def port_dolu_mu():
         s.close()
 
 
-# --------------------------------------------------------------- durdurma
-if os.environ.get("DURDUR"):
-    print("llama-server durduruluyor...")
-    subprocess.run(["pkill", "-f", "llama-server"])
+def sunucu_pidleri():
+    """Gercekten llama-server olan sureclerin (pid, args) listesi.
+
+    'pkill -f llama-server' KULLANILMAZ: komut satirinda bu metin gecen her
+    sureci (ornegin bu betigi calistiran kabugu) oldururdu. Onun yerine her
+    adayin /proc/<pid>/cmdline'ina bakip calistirilabilir dosya adini dogrularz.
+    """
+    pidler = []
+    kendi = {os.getpid(), os.getppid()}
+    r = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return pidler
+    for parca in r.stdout.split():
+        try:
+            pid = int(parca)
+        except ValueError:
+            continue
+        if pid in kendi:
+            continue
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                args = [a for a in f.read().decode().split("\0") if a]
+        except Exception:
+            continue
+        if args and os.path.basename(args[0]) == "llama-server":
+            pidler.append((pid, args))
+    return pidler
+
+
+def calisan_args():
+    """Calisan llama-server'in komut satiri (yoksa None)."""
+    pidler = sunucu_pidleri()
+    return pidler[0][1] if pidler else None
+
+
+def arg_degeri(args, bayrak):
+    try:
+        return args[args.index(bayrak) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def sunucuyu_durdur():
+    """llama-server sureclerini nazikce durdur, gerekirse zorla."""
+    pidler = sunucu_pidleri()
+    if not pidler:
+        return False
+    for pid, _ in pidler:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(60):
+        time.sleep(1)
+        if not sunucu_pidleri():
+            return True
+    for pid, _ in sunucu_pidleri():   # hala duruyorsa zorla
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     time.sleep(2)
-    print("durduruldu." if not port_dolu_mu() else "hala calisiyor olabilir.")
-    sys.exit(0)
+    return True
 
-print("=" * 66)
-print("QWEN3.5-122B DENEMESI")
-print("=" * 66)
-print("Model   : %s" % os.path.basename(MODEL))
-print("Binary  : %s" % BINARY)
-print("Port    : %d | Baglam: %d token | Thread: %d (prefill %d)"
-      % (PORT, BAGLAM, THREAD, THREAD_BATCH))
 
-for yol, ad in [(BINARY, "llama-server"), (MODEL, "model dosyasi")]:
-    if not os.path.exists(yol):
-        print("\nHATA: %s bulunamadi -> %s" % (ad, yol))
-        if ad == "llama-server":
-            print("Once dataiku_llm_kur.py betigini calistirin.")
-        sys.exit(1)
+# ------------------------------------------------------------------ ANA AKIS
+def main():
+    if os.environ.get("DURDUR"):
+        print("llama-server durduruluyor...")
+        print("durduruldu." if sunucuyu_durdur() else "calisan llama-server yoktu.")
+        return
 
-# --------------------------------------------------------------- baslatma
-istenen = {"-m": MODEL, "-c": str(BAGLAM), "-t": str(THREAD),
-           "-tb": str(THREAD_BATCH)}
-mevcut = calisan_sunucu_args() if ayakta_mi() else None
-farklar = []
-if mevcut:
-    for bayrak, deger in istenen.items():
-        simdiki = arg_degeri(mevcut, bayrak)
-        if simdiki != deger:
-            farklar.append((bayrak, simdiki, deger))
+    print("=" * 66)
+    print("QWEN3.5-122B")
+    print("=" * 66)
+    print("Model   : %s" % os.path.basename(MODEL))
+    print("Port    : %d | Baglam: %d | Thread: %d (prefill %d)"
+          % (PORT, BAGLAM, THREAD, THREAD_BATCH))
+    print("Dusunme : %s" % ("ACIK (yavas, kaliteli)" if DUSUNME else "kapali (hizli)"))
 
-if mevcut and not farklar:
-    print("\nSunucu ZATEN ISTENEN AYARLARLA CALISIYOR, yeniden baslatilmadi.")
-elif mevcut and os.environ.get("YENIDEN_BASLATMA") == "0":
-    print("\nUYARI: Calisan sunucunun ayarlari FARKLI ama yeniden baslatma kapali:")
-    for bayrak, simdiki, istenen_d in farklar:
-        print("   %-4s calisan: %-12s istenen: %s" % (bayrak, simdiki, istenen_d))
-    print("   -> Asagidaki olcum ESKI ayarlarla yapiliyor.")
-else:
-    if mevcut:
-        print("\nCalisan sunucunun ayarlari farkli, yeniden baslatiliyor:")
-        for bayrak, simdiki, istenen_d in farklar:
-            print("   %-4s %s -> %s" % (bayrak, simdiki, istenen_d))
-        subprocess.run(["pkill", "-f", "llama-server"])
-        for _ in range(60):
-            time.sleep(1)
-            if not port_dolu_mu():
-                break
-    if port_dolu_mu():
-        print("\nHATA: %d portu baska bir surec tarafindan kullaniliyor." % PORT)
-        print("Baska port deneyin:  LLM_PORT=8081")
-        sys.exit(1)
-    komut = [BINARY, "-m", MODEL, "-c", str(BAGLAM),
-             "-t", str(THREAD), "-tb", str(THREAD_BATCH),
-             "--host", "127.0.0.1", "--port", str(PORT), "--jinja"]
-    if MLOCK:
-        komut.append("--mlock")  # sayfalar RAM'den tahliye edilmesin
-    print("\nBaslatiliyor (arka planda):\n  %s" % " ".join(komut))
-    print("Log dosyasi: %s" % LOG)
-    with open(LOG, "ab") as log:
-        subprocess.Popen(komut, stdout=log, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+    for yol, ad in [(BINARY, "llama-server"), (MODEL, "model dosyasi")]:
+        if not os.path.exists(yol):
+            print("\nHATA: %s bulunamadi -> %s" % (ad, yol))
+            if ad == "llama-server":
+                print("Once dataiku_llm_kur.py betigini calistirin.")
+            return
 
-    print("\nModel yukleniyor (71.7 GB, ilk acilista birkac dakika surebilir)...")
-    basla = time.time()
-    while True:
-        if ayakta_mi():
-            print("\nHAZIR! Yukleme suresi: %.0f saniye" % (time.time() - basla))
-            break
-        gecen = time.time() - basla
-        if gecen > 1200:
-            print("\nHATA: 20 dakikada acilmadi. Log'un sonu:")
-            subprocess.run(["tail", "-30", LOG])
-            sys.exit(1)
-        print("  ... %3.0f sn" % gecen, end="\r", flush=True)
-        time.sleep(5)
+    # --- sunucu durumu: ayarlar uyusuyor mu?
+    istenen = {"-m": MODEL, "-c": str(BAGLAM), "-t": str(THREAD),
+               "-tb": str(THREAD_BATCH)}
+    mevcut = calisan_args() if ayakta_mi() else None
+    farklar = [(b, arg_degeri(mevcut, b), d) for b, d in istenen.items()
+               if mevcut and arg_degeri(mevcut, b) != d]
 
-# --------------------------------------------------------------- deneme
-SORU = ("Sen bir veri analizi asistanisin. Kisa ve net cevap ver.\n"
-        "Soru: Bir bankada kredi riski modellemesinde PD, LGD ve EAD "
-        "kavramlarini birer cumleyle acikla.")
+    if mevcut and not farklar:
+        print("\nSunucu ZATEN ISTENEN AYARLARLA CALISIYOR.")
+    else:
+        if mevcut:
+            print("\nAyarlar farkli, sunucu yeniden baslatiliyor:")
+            for bayrak, simdiki, hedef in farklar:
+                print("   %-4s %s -> %s" % (bayrak, simdiki, hedef))
+            sunucuyu_durdur()
+        if port_dolu_mu():
+            print("\nHATA: %d portu dolu. LLM_PORT=8081 ile deneyin." % PORT)
+            return
 
-print("\n" + "=" * 66)
-print("DENEME SORUSU GONDERILIYOR")
-print("=" * 66)
-print(SORU)
+        komut = [BINARY, "-m", MODEL, "-c", str(BAGLAM),
+                 "-t", str(THREAD), "-tb", str(THREAD_BATCH),
+                 "--host", "127.0.0.1", "--port", str(PORT), "--jinja"]
+        if MLOCK:
+            komut.append("--mlock")
+        print("\nBaslatiliyor:\n  %s" % " ".join(komut))
+        with open(LOG, "ab") as log:
+            subprocess.Popen(komut, stdout=log, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
 
-govde = {
-    "messages": [{"role": "user", "content": SORU}],
-    "max_tokens": 300,
-    "chat_template_kwargs": {"enable_thinking": False},  # hizli cevap icin
-}
-govde.update(ORNEKLEME)
+        print("\nModel yukleniyor (71.7 GiB)...")
+        basla = time.time()
+        while not ayakta_mi():
+            gecen = time.time() - basla
+            if gecen > 1200:
+                print("\nHATA: 20 dakikada acilmadi. Log sonu:")
+                subprocess.run(["tail", "-30", LOG])
+                return
+            print("  ... %3.0f sn" % gecen, end="\r", flush=True)
+            time.sleep(5)
+        print("\nHAZIR! Yukleme: %.0f sn" % (time.time() - basla))
 
-t0 = time.time()
-try:
-    cevap = istek("/v1/chat/completions", govde, zaman_asimi=1800)
-except urllib.error.HTTPError as e:
-    print("\nHATA %s: %s" % (e.code, e.read().decode()[:500]))
-    sys.exit(1)
-sure = time.time() - t0
+    # --- deneme sorusu
+    soru = os.environ.get("SORU", VARSAYILAN_SORU)
+    print("\n" + "=" * 66)
+    print("DENEME SORUSU")
+    print("=" * 66)
+    print(soru)
 
-metin = cevap["choices"][0]["message"]["content"]
-kullanim = cevap.get("usage", {})
-uretilen = kullanim.get("completion_tokens", 0)
+    govde = {
+        "messages": [{"role": "system", "content": SISTEM_MESAJI},
+                     {"role": "user", "content": soru}],
+        "max_tokens": 2000 if DUSUNME else 400,
+        "chat_template_kwargs": {"enable_thinking": DUSUNME},
+    }
+    govde.update(ORNEKLEME)
 
-print("\n--- MODELIN CEVABI ---")
-print(metin.strip())
-print("\n--- OLCUM ---")
-print("Sure          : %.1f saniye" % sure)
-print("Uretilen token: %s" % uretilen)
-if uretilen and sure > 0:
-    print("Hiz           : %.2f token/sn" % (uretilen / sure))
-print("Girdi token   : %s" % kullanim.get("prompt_tokens", "?"))
+    t0 = time.time()
+    try:
+        cevap = istek("/v1/chat/completions", govde, zaman_asimi=3600)
+    except urllib.error.HTTPError as e:
+        print("\nHATA %s: %s" % (e.code, e.read().decode()[:500]))
+        return
+    except Exception as e:
+        print("\nHATA: %s" % e)
+        return
+    sure = time.time() - t0
 
-print("\n" + "=" * 66)
-print("SUNUCU AYAKTA KALDI -> %s/v1" % KOK_URL)
-print("Dataiku LLM Mesh baglantisi icin bu adresi kullanin.")
-print("Durdurmak icin: DURDUR=1 ile bu betigi tekrar calistirin.")
+    mesaj = cevap["choices"][0]["message"]
+    dusunce = mesaj.get("reasoning_content") or ""
+    kullanim = cevap.get("usage", {})
+    uretilen = kullanim.get("completion_tokens", 0)
+
+    if dusunce:
+        print("\n--- DUSUNME (ilk 400 karakter) ---")
+        print(dusunce.strip()[:400] + ("..." if len(dusunce) > 400 else ""))
+    print("\n--- CEVAP ---")
+    print((mesaj.get("content") or "").strip())
+
+    print("\n--- OLCUM ---")
+    print("Sure          : %.1f sn" % sure)
+    print("Girdi token   : %s (sistem mesaji dahil)" % kullanim.get("prompt_tokens", "?"))
+    print("Uretilen token: %s" % uretilen)
+    if uretilen and sure:
+        print("Hiz           : %.2f token/sn" % (uretilen / sure))
+
+    print("\n" + "=" * 66)
+    print("Sunucu ayakta -> %s/v1" % KOK_URL)
+    print("Dataiku LLM Mesh: Base URL bu adres, API key 'local'.")
+    print("Durdurmak icin: DURDUR=1 ile tekrar calistirin.")
+
+
+main()
