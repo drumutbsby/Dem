@@ -28,7 +28,11 @@ BINARY = os.environ.get(
     "LLAMA_SERVER", os.path.expanduser("~/llama.cpp/build/bin/llama-server"))
 PORT = int(os.environ.get("LLM_PORT", "8080"))
 BAGLAM = int(os.environ.get("LLM_CTX", "32768"))
-THREAD = int(os.environ.get("LLM_THREAD", str(max(4, (os.cpu_count() or 32) - 8))))
+# Olculen (llama-bench, 2026-08-21): uretim 32 thread'te en hizli (7.23 tok/sn),
+# prefill 28 thread'te (73 tok/sn); 32'de cekismeden dusuyor. Bu yuzden ayri ayri.
+THREAD = int(os.environ.get("LLM_THREAD", str(os.cpu_count() or 32)))
+THREAD_BATCH = int(os.environ.get("LLM_THREAD_BATCH", str(max(1, (os.cpu_count() or 32) - 4))))
+MLOCK = os.environ.get("LLM_MLOCK", "0") == "1"  
 LOG = os.path.expanduser("~/llama-server.log")
 KOK_URL = "http://127.0.0.1:%d" % PORT
 
@@ -75,7 +79,8 @@ print("QWEN3.5-122B DENEMESI")
 print("=" * 66)
 print("Model   : %s" % os.path.basename(MODEL))
 print("Binary  : %s" % BINARY)
-print("Port    : %d | Baglam: %d token | Thread: %d" % (PORT, BAGLAM, THREAD))
+print("Port    : %d | Baglam: %d token | Thread: %d (prefill %d)"
+      % (PORT, BAGLAM, THREAD, THREAD_BATCH))
 
 for yol, ad in [(BINARY, "llama-server"), (MODEL, "model dosyasi")]:
     if not os.path.exists(yol):
@@ -92,8 +97,11 @@ else:
         print("\nHATA: %d portu baska bir surec tarafindan kullaniliyor." % PORT)
         print("Baska port deneyin:  LLM_PORT=8081")
         sys.exit(1)
-    komut = [BINARY, "-m", MODEL, "-c", str(BAGLAM), "-t", str(THREAD),
+    komut = [BINARY, "-m", MODEL, "-c", str(BAGLAM),
+             "-t", str(THREAD), "-tb", str(THREAD_BATCH),
              "--host", "127.0.0.1", "--port", str(PORT), "--jinja"]
+    if MLOCK:
+        komut.append("--mlock")  # sayfalar RAM'den tahliye edilmesin
     print("\nBaslatiliyor (arka planda):\n  %s" % " ".join(komut))
     print("Log dosyasi: %s" % LOG)
     with open(LOG, "ab") as log:
