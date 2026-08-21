@@ -26,7 +26,7 @@ import urllib.request
 
 KLASOR = os.environ.get(
     "LLM_KLASOR", "/data/dataiku/DATA_DIR/managed_folders/UMUT/NwPGcMBJ")
-MTP_DIZIN = os.path.join(KLASOR, "MTP")
+MTP_DIZIN = os.path.join(KLASOR, "MTP", os.environ.get("LLM_QUANT", "UD-Q4_K_XL"))
 BINARY = os.environ.get(
     "LLAMA_SERVER", os.path.expanduser("~/llama.cpp/build/bin/llama-server"))
 PORT = int(os.environ.get("LLM_PORT", "8080"))
@@ -34,14 +34,25 @@ BAGLAM = int(os.environ.get("LLM_CTX", "32768"))
 THREAD = int(os.environ.get("LLM_THREAD", str(max(4, (os.cpu_count() or 32) - 8))))
 LOG = os.path.expanduser("~/llama-server-mtp.log")
 KOK_URL = "http://127.0.0.1:%d" % PORT
-TABAN = ("https://huggingface.co/unsloth/Qwen3.5-122B-A10B-MTP-GGUF"
-         "/resolve/main/UD-Q4_K_XL/")
+# Hangi kalite seviyesi? UD-Q4_K_XL (77 GB) | UD-Q5_K_XL (93 GB) | UD-Q6_K_XL
+KUANT = os.environ.get("LLM_QUANT", "UD-Q4_K_XL")
+DEPO = "unsloth/Qwen3.5-122B-A10B-MTP-GGUF"
+TABAN = "https://huggingface.co/%s/resolve/main/%s/" % (DEPO, KUANT)
+API = "https://huggingface.co/api/models/%s/tree/main/%s" % (DEPO, KUANT)
 
-DOSYALAR = [
-    ("Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf", 10943808),
-    ("Qwen3.5-122B-A10B-UD-Q4_K_XL-00002-of-00003.gguf", 49667346080),
-    ("Qwen3.5-122B-A10B-UD-Q4_K_XL-00003-of-00003.gguf", 28968190016),
-]
+
+def dosya_listesi():
+    """Dosya adlarini ve tam bayt boyutlarini HF API'sinden canli oku."""
+    with urllib.request.urlopen(API, timeout=30) as y:
+        agac = json.loads(y.read().decode())
+    dosyalar = sorted((d["path"].split("/")[-1], d["size"]) for d in agac
+                      if d.get("type") == "file" and d["path"].endswith(".gguf"))
+    if not dosyalar:
+        raise RuntimeError("'%s' klasorunde .gguf bulunamadi" % KUANT)
+    return dosyalar
+
+
+DOSYALAR = dosya_listesi()
 TOPLAM = sum(b for _, b in DOSYALAR)
 
 
@@ -102,7 +113,7 @@ def ayakta_mi():
 
 # ------------------------------------------------------------------ 1) indir
 print("=" * 66)
-print("MTP SURUMU INDIRILIYOR (%.0f GiB)" % (TOPLAM / 1024 ** 3))
+print("MTP SURUMU INDIRILIYOR: %s (%.0f GiB)" % (KUANT, TOPLAM / 1024 ** 3))
 print("=" * 66)
 os.makedirs(MTP_DIZIN, exist_ok=True)
 bos = shutil.disk_usage(MTP_DIZIN).free
@@ -169,7 +180,7 @@ hiz = uretilen / sure if sure else 0
 
 print(cevap["choices"][0]["message"]["content"].strip())
 print("\n--- KARSILASTIRMA ---")
-print("MTP'siz (onceki olcum) : 5.80 token/sn")
+print("MTP'siz Q4 (olculen)   : 5.80 token/sn")
 print("MTP ile                : %.2f token/sn  (%s)" %
       (hiz, "%.1fx hizlanma" % (hiz / 5.80) if hiz else "-"))
 print("Sure: %.1f sn | Uretilen: %d token" % (sure, uretilen))
