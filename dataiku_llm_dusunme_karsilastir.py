@@ -53,9 +53,12 @@ SORU = """Bir tuketici kredisi portfoyunde 12 aylik PD %3,2, LGD %45 ve toplam E
     izlersin?"""
 
 # Uretici onerisi: her mod icin farkli ornekleme parametreleri
+# max_token: dusunmesiz modda butun butce cevaba gider; dusunme modunda
+# butce once akil yurutmeye harcanir, o yuzden daha yuksek verilir.
+# (Ilk olcumde dusunmesiz mod 800 token'da kesilmisti -> karsilastirma adaletsizdi.)
 AYARLAR = [
-    ("DUSUNME KAPALI", False, {"temperature": 0.7, "top_p": 0.8, "presence_penalty": 1.5}, 800),
-    ("DUSUNME ACIK", True, {"temperature": 1.0, "top_p": 0.95, "presence_penalty": 1.5}, 4000),
+    ("DUSUNME KAPALI", False, {"temperature": 0.7, "top_p": 0.8, "presence_penalty": 1.5}, 2500),
+    ("DUSUNME ACIK", True, {"temperature": 1.0, "top_p": 0.95, "presence_penalty": 1.5}, 5000),
 ]
 
 
@@ -73,6 +76,7 @@ def akisli_sor(dusunme, ornekleme, max_token):
                                data=json.dumps(govde).encode(),
                                headers={"Content-Type": "application/json"})
     cevap, dusunce, sayac = [], [], 0
+    bitis_nedeni = None
     ilk_token_suresi = None
     t0 = time.time()
     with urllib.request.urlopen(r, timeout=3600) as y:
@@ -87,7 +91,10 @@ def akisli_sor(dusunme, ornekleme, max_token):
                 parca = json.loads(veri)
             except ValueError:
                 continue
-            delta = parca.get("choices", [{}])[0].get("delta", {})
+            secim = parca.get("choices", [{}])[0]
+            if secim.get("finish_reason"):
+                bitis_nedeni = secim["finish_reason"]
+            delta = secim.get("delta", {})
             if delta.get("reasoning_content"):
                 dusunce.append(delta["reasoning_content"])
                 sayac += 1
@@ -102,7 +109,7 @@ def akisli_sor(dusunme, ornekleme, max_token):
                       end="\r", flush=True)
     sure = time.time() - t0
     print("\r" + " " * 62)  # ilerleme satirini temizle
-    return "".join(cevap), "".join(dusunce), sayac, sure, ilk_token_suresi
+    return "".join(cevap), "".join(dusunce), sayac, sure, ilk_token_suresi, bitis_nedeni
 
 
 def dogru_sayi_var_mi(metin):
@@ -131,7 +138,8 @@ def main():
         print(ad)
         print("=" * 70)
         try:
-            cevap, dusunce, token, sure, ilk = akisli_sor(dusunme, ornekleme, max_token)
+            cevap, dusunce, token, sure, ilk, bitis = akisli_sor(
+                dusunme, ornekleme, max_token)
         except Exception as e:
             print("HATA: %s" % e)
             continue
@@ -142,6 +150,9 @@ def main():
             print()
         print("--- CEVAP ---")
         print(cevap.strip())
+        if bitis == "length":
+            print("\n!!! UYARI: cevap token limitine (%d) takilip KESILDI." % max_token)
+            print("    Karsilastirma adaletsiz olabilir; limiti artirip tekrarlayin.")
         dogru = dogru_sayi_var_mi(cevap)
         print("\nSure: %.0f sn | Token: %d | Ilk token: %.1f sn | Hiz: %.2f tok/sn"
               % (sure, token, ilk or 0, token / sure if sure else 0))

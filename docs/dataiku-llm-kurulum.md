@@ -72,6 +72,48 @@ sunuluyor ya da hipervizör zaten serpiştiriyor. Bırakın kapalı kalsın.
 Efektif bellek bandı ~40 GB/s (teorik ~200 GB/s); tavana ulaşılamamasının sebebi
 sanallaştırma katmanı, daha fazla ayarla kapatılamadı.
 
+
+### Sistem mesajının etkisi (ölçüldü)
+
+Sistem mesajı olmadan model İngilizce terimleri kelimesi kelimesine çeviriyordu:
+"PD (Olasılık Varsayılan)", "Varsayılan anında". Terim sözlüğü içeren sistem mesajı
+eklendikten sonra aynı soruda çıktı: **"PD (Temerrüt Olasılığı)", "LGD (Temerrüt Halinde
+Kayıp Oranı)", "EAD (Temerrüt Anındaki Risk Tutarı)"** — hepsi doğru. Sistem mesajı
+`dataiku_llm_baslat.py` içinde gömülü; Dataiku LLM Mesh'te de aynısını kullanın.
+Maliyeti 533 girdi token'ı (yaklaşık 3 saniye prefill).
+
+### Düşünme modu: 2,8× maliyet, belirgin kalite kazancı yok
+
+Çok adımlı bir soruyla (aritmetik + TFRS 9 aşama geçişi + geriye dönük test metodolojisi)
+iki mod karşılaştırıldı:
+
+| | Düşünme kapalı | Düşünme açık |
+|---|---|---|
+| Süre | 122 sn | **347 sn (2,8×)** |
+| Üretilen token | 800 | 2.378 (+4.827 karakter akıl yürütme) |
+| Beklenen kayıp hesabı (3.600.000 TL) | doğru | doğru |
+| İlk token gecikmesi | 6,5 sn | 0,8 sn |
+
+**Sonuç: düşünme modu bu iş için maliyetini karşılamıyor.** Aritmetiği ikisi de doğru
+yaptı, içerik derinliği benzerdi. Dahası düşünme modunda dil bozulmaları görüldü —
+cevabın ortasında İngilizce kelime sızması ("şu değişiklikler *occurs*") ve bozuk Türkçe
+("görülürüldüğünde"). Muhtemel sebep: üreticinin düşünme modu için önerdiği
+`temperature=1.0`, Q4 kuantizasyonuyla birleşince örnekleme gürültüsünü artırıyor.
+Düşünme modu kullanılacaksa `temperature=0.7` denenmeli.
+
+Akıl yürütme zinciri Türkçe soruya rağmen **İngilizce** üretiliyor; bu Qwen'de normaldir
+ve cevabın dilini etkilemez.
+
+> Not: ilk ölçümde düşünmesiz moda 800 token limiti konduğu için cevap kesilmişti;
+> karşılaştırma bu yüzden düşünme modu lehine yanlıydı. Betikteki bütçe 2.500'e çıkarıldı
+> ve limite takılma artık uyarı basıyor.
+
+### -tb (prefill thread) kazancı
+
+Uçtan uca gerçek istek hızı: 5,80 → 6,50 (`-t 32`) → **6,85 tok/sn** (`-t 32 -tb 28`).
+llama-bench'in saf üretim ölçümü 7,23 tok/sn; aradaki fark girdi işleme, sohbet şablonu
+ve HTTP yükünden geliyor, beklenen bir fark.
+
 ## Üretim yapılandırması
 
 ```bash
@@ -99,9 +141,10 @@ Administration → Connections → New connection → **LLM Mesh → OpenAI (com
 
 ## Kullanım notları
 
-- **Düşünme modu** varsayılan açıktır ve kaliteyi belirgin artırır, ama cevaptan önce
-  yüzlerce token üretir (7 tok/sn'de dakikalar). Hızlı cevap için istek gövdesine:
+- **Düşünme modunu kapalı tutun** (ölçüm yukarıda): 2,8× maliyet getiriyor, bu iş yükünde
+  kalite kazancı görülmedi. İstek gövdesine:
   `"chat_template_kwargs": {"enable_thinking": false}`
+  Çok adımlı araştırma/analiz görevlerinde tekrar denemeye değer.
 - **Örnekleme (üretici önerisi):** düşünme modunda `temperature=1.0, top_p=0.95, top_k=20,
   presence_penalty=1.5`; instruct modunda `temperature=0.7, top_p=0.8, top_k=20,
   presence_penalty=1.5`.
@@ -123,3 +166,4 @@ Administration → Connections → New connection → **LLM Mesh → OpenAI (com
 | `dataiku_llm_hiz_ayari.py` | Thread/NUMA taraması yapıp en iyi ayarla yeniden başlatır |
 | `dataiku_llm_kalite_testi.py` | Greedy determinizm testi: hızlandırma çıktıyı değiştiriyor mu |
 | `dataiku_llm_mtp_yukselt.py` | MTP sürümü (bu donanımda faydasız, GPU eklenirse kullanılabilir) |
+| `dataiku_llm_dusunme_karsilastir.py` | Düşünme modunu açık/kapalı karşılaştırır, hesabı doğrular |
